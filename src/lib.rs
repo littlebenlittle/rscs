@@ -1,17 +1,25 @@
 use std::sync::mpsc;
 
 trait Client<Req, Res> {
-    type Error: std::error::Error;
+    type Error;
     fn new(tx: mpsc::Sender<Req>, rx: mpsc::Receiver<Res>) -> Self;
     fn send(&mut self, req: Req) -> Result<(), Self::Error>;
     fn recv(&mut self) -> Result<Res, Self::Error>;
 }
 
-trait Service<Req, Res> {
+trait ClientHandler<Req, Res, Svc: Service<Req, Res>> {
+    type Error;
+    fn send(&mut self, res: Res) -> Result<(), Self::Error>;
+    fn recv(&mut self) -> Result<Option<Req>, Self::Error>;
+}
+
+trait Service<Req, Res>: Sized {
     type Client: Client<Req, Res>;
-    type Error: std::error::Error;
-    // fn start(&mut self);
+    type Error: From<<Self::ClientHandler as ClientHandler<Req, Res, Self>>::Error>;
+    type ClientHandler: ClientHandler<Req, Res, Self>;
+
     fn client(&mut self) -> Result<Self::Client, Self::Error>;
+    fn process_next_request(&mut self) -> Result<(), Self::Error>;
 }
 
 #[cfg(test)]
@@ -31,23 +39,29 @@ mod test {
     }
 
     #[derive(Debug)]
-    struct ClientError(String);
+    struct Error(String);
 
-    impl std::fmt::Display for ClientError {
+    impl std::fmt::Display for Error {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.write_str(&self.0)
         }
     }
 
-    impl std::error::Error for ClientError {}
+    impl std::error::Error for Error {}
 
-    impl From<mpsc::SendError<Request>> for ClientError {
+    impl From<mpsc::SendError<Request>> for Error {
         fn from(e: mpsc::SendError<Request>) -> Self {
             Self(format!("{e:?}"))
         }
     }
 
-    impl From<mpsc::RecvError> for ClientError {
+    impl From<mpsc::SendError<Response>> for Error {
+        fn from(e: mpsc::SendError<Response>) -> Self {
+            Self(format!("{e:?}"))
+        }
+    }
+
+    impl From<mpsc::RecvError> for Error {
         fn from(e: mpsc::RecvError) -> Self {
             Self(format!("{e:?}"))
         }
@@ -59,7 +73,7 @@ mod test {
     }
 
     impl Client<Request, Response> for TestClient {
-        type Error = ClientError;
+        type Error = Error;
         fn new(tx: mpsc::Sender<Request>, rx: mpsc::Receiver<Response>) -> Self {
             Self { tx, rx }
         }
@@ -71,20 +85,24 @@ mod test {
         }
     }
 
-    #[derive(Debug)]
-    struct ServerError(String);
+    struct TestClientHandler {
+        tx: mpsc::Sender<Response>,
+        rx: mpsc::Receiver<Request>,
+    }
 
-    impl std::fmt::Display for ServerError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str(&self.0)
+    impl ClientHandler<Request, Response, TestService> for TestClientHandler {
+        type Error = Error;
+        fn send(&mut self, res: Response) -> Result<(), Self::Error> {
+            Ok(self.tx.send(res)?)
+        }
+        fn recv(&mut self) -> Result<Option<Request>, Self::Error> {
+            Ok(self.rx.iter().next())
         }
     }
 
-    impl std::error::Error for ServerError {}
-
     struct TestService {
         next_client_id: u8,
-        clients: BTreeMap<u8, (mpsc::Sender<Response>, mpsc::Receiver<Request>)>,
+        clients: BTreeMap<u8, TestClientHandler>,
     }
 
     impl TestService {
@@ -97,26 +115,47 @@ mod test {
     }
 
     impl Service<Request, Response> for TestService {
+        type Error = Error;
         type Client = TestClient;
-        type Error = ServerError;
+        type ClientHandler = TestClientHandler;
+
         fn client(&mut self) -> Result<Self::Client, Self::Error> {
             if self.next_client_id == u8::MAX {
-                return Err(ServerError("exceeded max clients".to_owned()));
+                return Err(Error("exceeded max clients".to_owned()));
             }
             let client_id = self.next_client_id;
             self.next_client_id += 1;
             let (ctx, srx) = mpsc::channel();
             let (stx, crx) = mpsc::channel();
-            self.clients.insert(client_id, (stx, srx));
+            self.clients
+                .insert(client_id, TestClientHandler { tx: stx, rx: srx });
             Ok(Self::Client::new(ctx, crx))
+        }
+
+        fn process_next_request(&mut self) -> Result<(), Self::Error> {
+            for (_id, client) in &mut self.clients {
+                match client.recv()? {
+                    Some(Request::Hello) => {
+                        client.send(Response::Hello)?;
+                        break;
+                    }
+                    None => {}
+                }
+            }
+            Ok(())
         }
     }
 
     #[test]
-    fn start_stop_server() -> Result<(), Box<dyn std::error::Error>> {
+    fn process_one_request() -> Result<(), Box<dyn std::error::Error>> {
+        env_logger::init();
+        log::info!("creating svc/cli");
         let mut svc = TestService::new();
         let mut cli = svc.client()?;
+        log::info!("sending request");
         cli.send(Request::Hello)?;
+        log::info!("processing request");
+        svc.process_next_request()?;
         assert_eq!(cli.recv()?, Response::Hello);
         Ok(())
     }
