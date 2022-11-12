@@ -7,15 +7,14 @@ pub trait Client<Req, Res> {
     type Error;
     fn new(tx: mpsc::Sender<Req>, rx: mpsc::Receiver<Res>) -> Self;
     async fn send(&mut self, req: Req) -> Result<(), Self::Error>;
-    async fn recv(&mut self) -> Result<Res, Self::Error>;
+    async fn recv(&mut self) -> Option<Res>;
 }
 
 #[async_trait]
 pub trait Handler<Req: Send, Res, Svc: Service<Req, Res>>: Send {
     type Error: std::error::Error + Send;
     async fn send(&mut self, res: Res) -> Result<(), Self::Error>;
-    async fn recv(&mut self) -> Result<Req, Self::Error>;
-    fn handle_recv_error(e: Self::Error);
+    async fn recv(&mut self) -> Option<Req>;
 }
 
 #[async_trait]
@@ -26,22 +25,20 @@ pub trait Service<Req: Send, Res>: Sized {
     type Handler: Handler<Req, Res, Self>;
 
     async fn process_request(req: Req, handler: &mut Self::Handler);
-    fn keep_serving(&self) -> bool;
     fn client(&mut self) -> Result<Self::Client, Self::Error>;
     fn handlers(&mut self) -> Vec<&mut Self::Handler>;
 
     async fn serve(&mut self) -> Result<(), Self::Error> {
-        while self.keep_serving() {
-            stream::iter(self.handlers())
-                .for_each_concurrent(None, |handler: &mut Self::Handler| async move {
-                    match handler.recv().await {
-                        Ok(req) => Self::process_request(req, handler).await,
-                        Err(e) => Self::Handler::handle_recv_error(e),
+        loop {
+            stream::iter(self.handlers()).for_each_concurrent(
+                None,
+                |handler: &mut Self::Handler| async move {
+                    if let Some(req) = handler.recv().await {
+                        Self::process_request(req, handler).await
                     }
-                })
-                .await;
+                },
+            ).await;
         }
-        Ok(())
     }
 }
 
@@ -52,7 +49,7 @@ mod test {
     use super::*;
     use crate::test_fixtures::{Error, Request, Response};
     use async_std::task;
-    use futures::{SinkExt, StreamExt};
+    use futures::{channel::oneshot, SinkExt, StreamExt};
 
     impl From<mpsc::SendError> for Error {
         fn from(e: mpsc::SendError) -> Self {
@@ -74,11 +71,8 @@ mod test {
         async fn send(&mut self, req: Request) -> Result<(), Self::Error> {
             Ok(self.tx.send(req).await?)
         }
-        async fn recv(&mut self) -> Result<Response, Self::Error> {
-            Ok(match self.rx.next().await {
-                Some(res) => res,
-                None => panic!("stream closed"),
-            })
+        async fn recv(&mut self) -> Option<Response> {
+            self.rx.next().await
         }
     }
 
@@ -93,20 +87,15 @@ mod test {
         async fn send(&mut self, res: Response) -> Result<(), Self::Error> {
             Ok(self.tx.send(res).await?)
         }
-        async fn recv(&mut self) -> Result<Request, Self::Error> {
-            Ok(match self.rx.next().await {
-                Some(res) => res,
-                None => panic!("stream closed"),
-            })
-        }
-        fn handle_recv_error(e: Self::Error) {
-            log::info!("failed to receive from handler: {e:?}")
+        async fn recv(&mut self) -> Option<Request> {
+            self.rx.next().await
         }
     }
 
     struct TestService {
         next_client_id: u8,
         handlers: BTreeMap<u8, TestHandler>,
+        keep_serving: bool,
     }
 
     impl TestService {
@@ -114,6 +103,7 @@ mod test {
             Self {
                 next_client_id: 0,
                 handlers: BTreeMap::new(),
+                keep_serving: true,
             }
         }
     }
@@ -133,27 +123,25 @@ mod test {
             self.next_client_id += 1;
             let (ctx, srx) = mpsc::channel(32);
             let (stx, crx) = mpsc::channel(32);
-            self.handlers
-                .insert(id, TestHandler { tx: stx, rx: srx });
+            self.handlers.insert(id, TestHandler { tx: stx, rx: srx });
             Ok(Self::Client::new(ctx, crx))
         }
-        
+
         fn handlers(&mut self) -> Vec<&mut Self::Handler> {
             self.handlers.values_mut().collect()
         }
 
         async fn process_request(req: Request, handler: &mut Self::Handler) {
-            match handler.send(match req {
-                Request::A => Response::A,
-                Request::B => Response::B,
-            }).await {
-                Ok(()) => {},
-                Err(e) => log::error!("failed to send response: {e:?}")
+            match handler
+                .send(match req {
+                    Request::A => Response::A,
+                    Request::B => Response::B,
+                })
+                .await
+            {
+                Ok(()) => {}
+                Err(e) => log::error!("failed to send response: {e:?}"),
             }
-        }
-
-        fn keep_serving(&self) -> bool {
-            true
         }
     }
 
@@ -164,8 +152,9 @@ mod test {
         let jh = task::spawn(async move { svc.serve().await });
         task::block_on(async move {
             cli.send(Request::A).await?;
-            assert_eq!(cli.recv().await?, Response::A);
-            jh.await
+            assert_eq!(cli.recv().await, Some(Response::A));
+            jh.cancel().await;
+            Result::<(), Error>::Ok(())
         })?;
         Ok(())
     }
