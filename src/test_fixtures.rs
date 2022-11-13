@@ -1,6 +1,7 @@
 pub enum Request {
     A,
     B,
+    Shutdown,
 }
 
 #[derive(Debug, PartialEq)]

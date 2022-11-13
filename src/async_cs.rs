@@ -30,14 +30,13 @@ pub trait Service<Req: Send, Res>: Sized {
 
     async fn serve(&mut self) -> Result<(), Self::Error> {
         loop {
-            stream::iter(self.handlers()).for_each_concurrent(
-                None,
-                |handler: &mut Self::Handler| async move {
+            stream::iter(self.handlers())
+                .for_each_concurrent(None, |handler: &mut Self::Handler| async move {
                     if let Some(req) = handler.recv().await {
                         Self::process_request(req, handler).await
                     }
-                },
-            ).await;
+                })
+                .await;
         }
     }
 }
@@ -49,7 +48,7 @@ mod test {
     use super::*;
     use crate::test_fixtures::{Error, Request, Response};
     use async_std::task;
-    use futures::{channel::oneshot, SinkExt, StreamExt};
+    use futures::{StreamExt, SinkExt};
 
     impl From<mpsc::SendError> for Error {
         fn from(e: mpsc::SendError) -> Self {
@@ -95,7 +94,6 @@ mod test {
     struct TestService {
         next_client_id: u8,
         handlers: BTreeMap<u8, TestHandler>,
-        keep_serving: bool,
     }
 
     impl TestService {
@@ -103,7 +101,6 @@ mod test {
             Self {
                 next_client_id: 0,
                 handlers: BTreeMap::new(),
-                keep_serving: true,
             }
         }
     }
@@ -132,16 +129,16 @@ mod test {
         }
 
         async fn process_request(req: Request, handler: &mut Self::Handler) {
-            match handler
-                .send(match req {
-                    Request::A => Response::A,
-                    Request::B => Response::B,
-                })
-                .await
-            {
-                Ok(()) => {}
-                Err(e) => log::error!("failed to send response: {e:?}"),
-            }
+            // match handler
+            //     .send(match req {
+            //         Request::A => Response::A,
+            //         Request::B => Response::B,
+            //     })
+            //     .await
+            // {
+            //     Ok(()) => {}
+            //     Err(e) => log::error!("failed to send response: {e:?}"),
+            // }
         }
     }
 

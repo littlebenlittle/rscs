@@ -14,9 +14,8 @@ impl Service {
         for rx in &mut self.handlers {
             let data_arc = self.data.clone();
             handlers.push(Box::pin(async move {
-                let mut data = data_arc.lock().unwrap();
                 if let Some(val) = rx.next().await {
-                    *data = val
+                    *data_arc.lock().unwrap() = val
                 }
             }));
         }
@@ -29,11 +28,11 @@ fn main() {
         handlers: Vec::new(),
         data: Arc::new(Mutex::new(true)),
     };
-    let (tx, rx) = mpsc::channel(8);
+    let (mut tx, rx) = mpsc::channel(8);
     svc.handlers.push(rx);
     let jh = task::spawn(async move { svc.handle_requests().await });
     task::block_on(async move {
-        tx.send(false).await;
+        tx.send(false).await.unwrap();
         jh.await
     });
 }

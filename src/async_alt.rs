@@ -1,72 +1,129 @@
+use crate::test_fixtures::Error;
 use futures::channel::mpsc;
+use futures::{SinkExt, StreamExt};
 use std::sync::{Arc, Mutex};
 
-use crate::test_fixtures::{Error, Request, Response};
-use futures::{stream, SinkExt, StreamExt};
-
-struct Client {
-    tx: mpsc::Sender<Request>,
-    rx: mpsc::Receiver<Response>,
+struct Client<Req, Res> {
+    tx: mpsc::Sender<Req>,
+    rx: mpsc::Receiver<Res>,
 }
 
-struct Handler {
-    tx: mpsc::Sender<Response>,
-    rx: mpsc::Receiver<Request>,
+impl<Req, Res> Client<Req, Res> {
+    pub async fn send(&mut self, req: Req) -> Result<(), mpsc::SendError> {
+        self.tx.send(req).await
+    }
+
+    pub async fn recv(&mut self) -> Option<Res> {
+        self.rx.next().await
+    }
 }
 
-struct Data {
-    keep_serving: bool,
+struct Handler<Req, Res> {
+    tx: mpsc::Sender<Res>,
+    rx: mpsc::Receiver<Req>,
 }
 
-struct Service {
-    next_client_id: u8,
-    handlers: Vec<Handler>,
-    data: Arc<Mutex<Data>>,
+trait ServiceData<Req, Res> {
+    fn keep_serving(&self) -> bool;
+    fn process_request(&mut self, req: Req) -> Option<Res>;
 }
 
-impl Service {
-    fn client(&mut self) -> Result<Client, Error> {
-        if self.next_client_id == u8::MAX {
-            return Err(Error("exceeded max clients".to_owned()));
+struct Service<Req, Res, D: ServiceData<Req, Res>> {
+    handlers: Vec<Handler<Req, Res>>,
+    data: Arc<Mutex<D>>,
+}
+
+impl<Req, Res, D> Service<Req, Res, D>
+where
+    D: ServiceData<Req, Res>,
+{
+    pub fn new(data: D) -> Self {
+        Self {
+            handlers: Vec::new(),
+            data: Arc::new(Mutex::new(data)),
         }
-        let client_id = self.next_client_id;
-        self.next_client_id += 1;
+    }
+}
+
+impl<Req, Res, D: ServiceData<Req, Res>> Service<Req, Res, D> {
+    fn client(&mut self) -> Result<Client<Req, Res>, Error> {
         let (ctx, srx) = mpsc::channel(32);
         let (stx, crx) = mpsc::channel(32);
         self.handlers.push(Handler { tx: stx, rx: srx });
         Ok(Client { tx: ctx, rx: crx })
     }
 
-    async fn process_request(req: Request, handler: &mut Handler, data: &mut Data) {
-        let res = match req {
-            Request::A => Response::A,
-            Request::B => Response::B,
-        };
-        match handler.tx.send(res).await {
-            Ok(()) => {}
-            Err(e) => log::error!("failed to send response: {e:?}"),
-        }
-    }
-    
-    async fn keep_serving(&mut self) -> bool {
-        self.data.lock().unwrap().keep_serving
-    }
-
     async fn serve(&mut self) -> Result<(), Error> {
-        while self.keep_serving().await {
+        while self.data.lock().unwrap().keep_serving() {
             let mut handlers = Vec::new();
             for handler in &mut self.handlers {
                 let data_arc = self.data.clone();
                 handlers.push(Box::pin(async move {
-                    let mut data = data_arc.lock().unwrap();
-                    match handler.rx.next().await {
-                        Some(req) => Self::process_request(req, handler, &mut *data).await,
-                        None => {}
+                    if let Some(req) = handler.rx.next().await {
+                        let res = {
+                            let mut data = data_arc.lock().unwrap();
+                            data.process_request(req)
+                        };
+                        if let Some(res) = res {
+                            match handler.tx.send(res).await {
+                                Ok(()) => {}
+                                Err(e) => log::error!("failed to send response: {e:?}"),
+                            }
+                        }
                     }
                 }))
             }
             futures::future::select_all(handlers).await;
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::test_fixtures::{Error, Request, Response};
+    use async_std::task;
+
+    struct Data {
+        keep_serving: bool,
+    }
+
+    impl From<mpsc::SendError> for Error {
+        fn from(e: mpsc::SendError) -> Self {
+            Self(format!("{e:?}"))
+        }
+    }
+
+    impl ServiceData<Request, Response> for Data {
+        fn keep_serving(&self) -> bool {
+            self.keep_serving
+        }
+        fn process_request(&mut self, req: Request) -> Option<Response> {
+            match req {
+                Request::A => Some(Response::A),
+                Request::B => Some(Response::B),
+                Request::Shutdown => {
+                    self.keep_serving = false;
+                    None
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn process_one_request() -> Result<(), Box<dyn std::error::Error>> {
+        env_logger::init();
+        let mut svc = Service::new(Data { keep_serving: true });
+        let mut cli = svc.client()?;
+        let jh = task::spawn(async move { svc.serve().await });
+        task::block_on(async move {
+            cli.send(Request::A).await?;
+            assert_eq!(cli.recv().await, Some(Response::A));
+            cli.send(Request::Shutdown).await?;
+            jh.await?;
+            Result::<(), Error>::Ok(())
+        })?;
         Ok(())
     }
 }

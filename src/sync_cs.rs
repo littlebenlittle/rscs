@@ -114,19 +114,19 @@ mod test {
         }
 
         fn process_next_request(&mut self) -> Result<(), Self::Error> {
-            for (_id, client) in &mut self.clients {
-                match client.recv()? {
-                    Some(Request::A) => {
-                        client.send(Response::A)?;
-                        break;
-                    }
-                    Some(Request::B) => {
-                        client.send(Response::B)?;
-                        break;
-                    }
-                    None => {}
-                }
-            }
+            //for (_id, client) in &mut self.clients {
+            //    match client.recv()? {
+            //        Some(Request::A) => {
+            //            client.send(Response::A)?;
+            //            break;
+            //        }
+            //        Some(Request::B) => {
+            //            client.send(Response::B)?;
+            //            break;
+            //        }
+            //        None => {}
+            //    }
+            //}
             Ok(())
         }
     }
