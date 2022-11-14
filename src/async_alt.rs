@@ -1,71 +1,94 @@
 use crate::test_fixtures::Error;
-use futures::channel::mpsc;
-use futures::{SinkExt, StreamExt};
+use async_trait::async_trait;
+use futures::channel::mpsc::{self, Receiver, Sender};
+use futures::{Future, Sink, SinkExt, Stream, StreamExt};
+use std::marker::PhantomData;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
+pub trait ClientId: Ord + Copy {}
+
+impl<T: Ord + Copy> ClientId for T {}
+
+pub trait ClientData<Req, Res, Id: ClientId> {
+    fn clients_mut(&mut self) -> Vec<(Id, &mut Sender<Res>, &mut Receiver<Req>)>;
+    fn num_clients(&self) -> usize;
+    fn add_client(&mut self, tx: Sender<Res>, rx: Receiver<Req>) -> Result<(), Error>;
+}
+
 struct Client<Req, Res> {
-    tx: mpsc::Sender<Req>,
-    rx: mpsc::Receiver<Res>,
+    tx: Sender<Req>,
+    rx: Receiver<Res>,
 }
 
 impl<Req, Res> Client<Req, Res> {
-    pub async fn send(&mut self, req: Req) -> Result<(), mpsc::SendError> {
-        self.tx.send(req).await
+    fn new(tx: Sender<Req>, rx: Receiver<Res>) -> Self {
+        Self
     }
-
-    pub async fn recv(&mut self) -> Option<Res> {
-        self.rx.next().await
-    }
+    fn send(&mut self) -> &mut Sender<Req>;
+    fn recv(&mut self) -> &mut Receiver<Res>;
 }
 
-struct Handler<Req, Res> {
-    tx: mpsc::Sender<Res>,
-    rx: mpsc::Receiver<Req>,
+pub trait ServiceData<Req, Res, C: ClientId> {
+    fn process_request(&mut self, client_id: C, req: Req) -> Option<Res>;
 }
 
-trait ServiceData<Req, Res> {
-    fn keep_serving(&self) -> bool;
-    fn process_request(&mut self, req: Req) -> Option<Res>;
-}
-
-struct Service<Req, Res, D: ServiceData<Req, Res>> {
-    handlers: Vec<Handler<Req, Res>>,
-    data: Arc<Mutex<D>>,
-}
-
-impl<Req, Res, D> Service<Req, Res, D>
+pub struct Service<Req: Send, Res, C, Id, Cd, Sd>
 where
-    D: ServiceData<Req, Res>,
+    Id: ClientId,
+    C: Client<Req, Res>,
+    Cd: ClientData<Req, Res, Id>,
+    Sd: ServiceData<Req, Res, Id>,
 {
-    pub fn new(data: D) -> Self {
+    client_data: Cd,
+    data: Arc<Mutex<Sd>>,
+    keep_serving: Arc<Mutex<bool>>,
+    _phandom_data: PhantomData<(Req, Res, C, Cd, Id)>,
+}
+
+impl<Req: Send, Res, C, Id, Cd, Sd> Service<Req, Res, C, Id, Cd, Sd>
+where
+    Id: ClientId,
+    C: Client<Req, Res>,
+    Cd: ClientData<Req, Res, Id>,
+    Sd: ServiceData<Req, Res, Id>,
+{
+    pub fn new(data: Sd, client_data: Cd) -> Self {
         Self {
-            handlers: Vec::new(),
+            client_data,
             data: Arc::new(Mutex::new(data)),
+            keep_serving: Arc::new(Mutex::new(true)),
+            _phandom_data: PhantomData,
         }
     }
-}
 
-impl<Req, Res, D: ServiceData<Req, Res>> Service<Req, Res, D> {
-    fn client(&mut self) -> Result<Client<Req, Res>, Error> {
+    fn client(&mut self) -> Result<C, Error> {
         let (ctx, srx) = mpsc::channel(32);
         let (stx, crx) = mpsc::channel(32);
-        self.handlers.push(Handler { tx: stx, rx: srx });
-        Ok(Client { tx: ctx, rx: crx })
+        self.client_data.add_client(stx, srx)?;
+        Ok(C::new(ctx, crx))
+    }
+
+    fn shutdown(&mut self) -> Pin<Box<dyn Future<Output = ()>>> {
+        let keep_serving_arc = self.keep_serving.clone();
+        Box::pin(async move {
+            *keep_serving_arc.lock().unwrap() = false;
+        })
     }
 
     async fn serve(&mut self) -> Result<(), Error> {
-        while self.data.lock().unwrap().keep_serving() {
-            let mut handlers = Vec::new();
-            for handler in &mut self.handlers {
+        while *self.keep_serving.lock().unwrap() {
+            let mut handlers = Vec::with_capacity(self.client_data.num_clients());
+            for (client_id, tx, rx) in self.client_data.clients_mut() {
                 let data_arc = self.data.clone();
                 handlers.push(Box::pin(async move {
-                    if let Some(req) = handler.rx.next().await {
+                    if let Some(req) = rx.next().await {
                         let res = {
                             let mut data = data_arc.lock().unwrap();
-                            data.process_request(req)
+                            data.process_request(client_id, req)
                         };
                         if let Some(res) = res {
-                            match handler.tx.send(res).await {
+                            match tx.send(res).await {
                                 Ok(()) => {}
                                 Err(e) => log::error!("failed to send response: {e:?}"),
                             }
@@ -81,32 +104,62 @@ impl<Req, Res, D: ServiceData<Req, Res>> Service<Req, Res, D> {
 
 #[cfg(test)]
 mod test {
+    use std::collections::BTreeMap;
+
     use super::*;
     use crate::test_fixtures::{Error, Request, Response};
     use async_std::task;
 
-    struct Data {
-        keep_serving: bool,
+    struct Data {}
+
+    struct DirectClient {
+        tx: Sender<Request>,
+        rx: Receiver<Response>,
     }
 
-    impl From<mpsc::SendError> for Error {
-        fn from(e: mpsc::SendError) -> Self {
-            Self(format!("{e:?}"))
+    impl Client<Request, Response> for DirectClient {
+        fn new(tx: Sender<Request>, rx: Receiver<Response>) -> Self {
+            Self { tx, rx }
         }
     }
 
-    impl ServiceData<Request, Response> for Data {
-        fn keep_serving(&self) -> bool {
-            self.keep_serving
+    type ClientId = u8;
+
+    struct ClientList {
+        handlers: BTreeMap<ClientId, (Sender<Response>, Receiver<Request>)>,
+        next_id: ClientId,
+    }
+
+    impl ClientData<Request, Response, ClientId> for ClientList {
+        fn add_client(&mut self, tx: Sender<Response>, rx: Receiver<Request>) -> Result<(), Error> {
+            if self.next_id == u8::MAX - 1 {
+                return Err(Error("num clients exceeds u8::MAX".to_owned()));
+            }
+            self.handlers.insert(self.next_id, (tx, rx));
+            self.next_id += 1;
+            Ok(())
         }
-        fn process_request(&mut self, req: Request) -> Option<Response> {
+
+        fn num_clients(&self) -> usize {
+            self.handlers.len()
+        }
+
+        fn clients_mut(
+            &mut self,
+        ) -> Vec<(ClientId, &mut Sender<Response>, &mut Receiver<Request>)> {
+            self.handlers
+                .iter_mut()
+                .map(|(id, (tx, rx))| (*id, tx, rx))
+                .collect()
+        }
+    }
+
+    impl ServiceData<Request, Response, ClientId> for Data {
+        fn process_request(&mut self, _client_id: ClientId, req: Request) -> Option<Response> {
             match req {
                 Request::A => Some(Response::A),
                 Request::B => Some(Response::B),
-                Request::Shutdown => {
-                    self.keep_serving = false;
-                    None
-                }
+                _ => None,
             }
         }
     }
@@ -114,13 +167,21 @@ mod test {
     #[test]
     fn process_one_request() -> Result<(), Box<dyn std::error::Error>> {
         env_logger::init();
-        let mut svc = Service::new(Data { keep_serving: true });
+        let mut svc = Service::<Request, Response, DirectClient, ClientId, ClientList, Data>::new(
+            Data {},
+            ClientList {
+                handlers: BTreeMap::new(),
+                next_id: 0,
+            },
+        );
         let mut cli = svc.client()?;
+        let shutdown = svc.shutdown();
         let jh = task::spawn(async move { svc.serve().await });
         task::block_on(async move {
             cli.send(Request::A).await?;
             assert_eq!(cli.recv().await, Some(Response::A));
             cli.send(Request::Shutdown).await?;
+            shutdown.await;
             jh.await?;
             Result::<(), Error>::Ok(())
         })?;

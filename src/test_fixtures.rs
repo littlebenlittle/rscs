@@ -20,3 +20,9 @@ impl std::fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+impl From<futures::channel::mpsc::SendError> for Error {
+    fn from(e: futures::channel::mpsc::SendError) -> Self {
+        Self(format!("{e:?}"))
+    }
+}
