@@ -17,15 +17,11 @@ use futures::{channel::mpsc, SinkExt, Stream, StreamExt};
 struct CString(Vec<u8>);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::init();
     // spawn is a more general setting than block_on
     let jh = task::spawn(async {
-        log::debug!("creating channels");
         let (mut tx, rx) = mpsc::channel(16);
-        log::debug!("converting stream");
         let mut stream = rx.parse_with(CStringParser::new());
         for c in [1, 2, 3, 4, 0, 4, 3, 2, 1, 0] {
-            log::debug!("sending byte: {c}");
             tx.send(c).await?;
         }
         assert_eq!(stream.next().await, Some(CString(vec!(1, 2, 3, 4, 0))));
@@ -53,7 +49,6 @@ impl CStringParser {
     }
 
     fn process_next_byte(&mut self, byte: u8) -> ParseStatus<CString> {
-        log::debug!("processing byte: {byte}, context = {:?}", self.context);
         self.context.push(byte);
         match self.context.last().unwrap() {
             0 => ParseStatus::Finished(CString(self.context.drain(..).collect())),
@@ -149,27 +144,22 @@ where
 ///
 impl<I, O, P, Si> Stream for ParseWithStream<I, O, P, Si>
 where
-    I: std::fmt::Display,
     P: Parser<I, O>,
     Si: Stream<Item = I> + Unpin,
 {
     type Item = O;
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        log::debug!("polling next item");
-        let next_item: I = match self.inner.lock().unwrap().poll_next_unpin(cx) {
-            Poll::Ready(Some(t)) => t,
-            Poll::Ready(None) => return Poll::Ready(None),
-            Poll::Pending => return Poll::Pending,
-        };
-        log::debug!("got next item: {next_item}");
-        match self.parser.lock().unwrap().process_next_item(next_item) {
-            ParseStatus::Finished(o) => {
-                log::debug!("ParseStatus: Finished");
-                Poll::Ready(Some(o))
-            }
-            ParseStatus::Incomplete => {
-                log::debug!("ParseStatus: Incomplete");
-                Poll::Pending
+        loop {
+            let next_item: I = match self.inner.lock().unwrap().poll_next_unpin(cx) {
+                Poll::Ready(Some(t)) => t,
+                Poll::Ready(None) => break Poll::Ready(None),
+                Poll::Pending => break Poll::Pending,
+            };
+            match self.parser.lock().unwrap().process_next_item(next_item) {
+                ParseStatus::Finished(o) => {
+                    break Poll::Ready(Some(o));
+                }
+                ParseStatus::Incomplete => {}
             }
         }
     }
