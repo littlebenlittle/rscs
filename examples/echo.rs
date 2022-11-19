@@ -11,7 +11,7 @@ use std::{
 
 use rscs::{ParseStatus, ParseWith, Parser};
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 enum Message {
     Noop,
     Echo(String),
@@ -179,10 +179,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let tx = Arc::new(Mutex::new(tx));
                 let reader_fut = reader
                     .bytes()
-                    .inspect(|byte| {
-                        let byte = ok_or_log_err!(byte);
-                        log::debug!("service got byte: {byte}");
-                    })
                     .take_while(|byte| take_unless!(byte, 3))
                     .parse_with(MessageDecoder::new())
                     .inspect(|msg| {
@@ -213,40 +209,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 futures::future::join(reader_fut, writer_fut).await;
                 log::debug!("done handling client");
             });
-        let mut client = async_std::net::TcpStream::connect(listen_addr).await?;
+        let client = async_std::net::TcpStream::connect(listen_addr).await?;
         let client_fut = async move {
             let (tx, mut rx) = mpsc::channel(32);
             let tx = Arc::new(Mutex::new(tx));
-            let msgs = [Message::Noop, Message::Echo("test".into())];
-            let encode_fut = stream::iter(msgs)
+            let msgs = [
+                Message::Noop,
+                Message::Echo("test".into()),
+                Message::Noop,
+                Message::Echo("somthing".into()),
+                Message::Echo("else".into()),
+                Message::Noop,
+            ];
+            let encode_fut = stream::iter(msgs.clone())
+                .inspect(|msg| log::debug!("client encoding msg: {msg:?}"))
                 .parse_with(MessageEncoder::new())
                 .take_while(|byte| future::ready(byte.is_ok()))
                 .map(|byte| byte.unwrap())
                 .chain(stream::iter([3])) // EOT
                 .ready_chunks(16)
                 .for_each(|bytes| async_lock!(tx, ok_or_log_err!(tx.send(bytes).await)))
-                .then(|_| async { log::debug!("done encoding messages") });
-            let send_fut = async {
-                if let Some(bytes) = rx.next().await {
+                .then(|_| {
+                    async_lock!(tx, {
+                        log::debug!("done encoding messages");
+                        tx.close_channel()
+                    })
+                });
+            let (reader, mut writer) = client.split();
+            let writer_fut = async move {
+                while let Some(bytes) = rx.next().await {
                     log::debug!("sending bytes: {bytes:?}");
-                    ok_or_log_err!(client.write_all(&bytes).await);
+                    ok_or_log_err!(writer.write_all(&bytes).await);
                 }
                 log::debug!("client sending EOT");
-                ok_or_log_err!(client.write_all(&[3]).await);
+                ok_or_log_err!(writer.write_all(&[3]).await);
             };
-            futures::future::join(encode_fut, send_fut).await;
-            log::debug!("receiving bytes on client");
-            client
+            let reader_fut = reader
                 .bytes()
                 .take_while(|byte| take_unless!(byte, 3))
                 .map(|byte| byte.unwrap())
-                .inspect(|byte| log::debug!("client got byte: {byte}"))
                 .parse_with(MessageDecoder::new())
-                .for_each(|msg| async move {
-                    let msg = ok_or_log_err!(msg);
-                    log::debug!("client got msg: {msg:?}");
-                })
-                .await;
+                .map(|msg| msg.unwrap())
+                .inspect(|msg| log::debug!("client got msg: {:?}", msg))
+                .zip(stream::iter(msgs))
+                .for_each(|(got, exp)| async move { assert_eq!(got, exp) });
+            futures::future::join3(encode_fut, reader_fut, writer_fut).await;
         };
         futures::future::join(service_fut, client_fut).await;
         Result::<(), Error>::Ok(())
