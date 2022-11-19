@@ -1,7 +1,7 @@
 
-# Rust Client-Serice Framework
+# Rust Client-Service Framework
 
-A framework for handling asynchronous communication between multiple clients and a single service communication between multiple clients and a single service.
+A framework for handling asynchronous communication between multiple clients and a single service.
 
 ## Status
 
