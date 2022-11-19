@@ -1,0 +1,10 @@
+
+# Rust Client-Serice Framework
+
+A framework for handling asynchronous communication between multiple clients and a single service communication between multiple clients and a single service.
+
+## Status
+
+This is a research project. I am learning about Rust's async system. Don't expect anything to work and do expect the project to be quite a mess for the foreseeable future.
+
+See [`examples/echo.rs`](examples/echo.rs) for an initial example of a byte stream encoder/decoder over TCP.
