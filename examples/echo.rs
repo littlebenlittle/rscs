@@ -17,17 +17,11 @@ enum Message {
     Echo(String),
 }
 
-struct MessageEncoder {
-    more: Option<Vec<u8>>,
-    more_index: usize,
-}
+struct MessageEncoder {}
 
 impl MessageEncoder {
     fn new() -> Self {
-        Self {
-            more: Some(Vec::new()),
-            more_index: 0,
-        }
+        Self {}
     }
     fn encode(msg: Message) -> Vec<u8> {
         match msg {
@@ -37,6 +31,7 @@ impl MessageEncoder {
                 bytes.push(1u8);
                 bytes.extend(s.into_bytes());
                 bytes.push(0);
+                bytes.reverse();
                 bytes
             }
         }
@@ -45,27 +40,7 @@ impl MessageEncoder {
 
 impl Parser<Message, u8, Error> for MessageEncoder {
     fn process_next_item(&mut self, item: Message) -> ParseStatus<u8, Error> {
-        let bytes = Self::encode(item);
-        if bytes.len() > 1 {
-            self.more = Some(bytes[1..].to_vec());
-            ParseStatus::Output(bytes[0])
-        } else {
-            ParseStatus::Output(bytes[0])
-        }
-    }
-    fn get_more(&mut self) -> Option<u8> {
-        let more = self.more.take();
-        if let Some(more) = more {
-            self.more_index += 1;
-            if self.more_index >= more.len() {
-                self.more_index = 0;
-                return None;
-            }
-            let byte = more[self.more_index];
-            self.more = Some(more);
-            return Some(byte);
-        }
-        return None;
+        ParseStatus::Output(Self::encode(item))
     }
 }
 
@@ -89,27 +64,29 @@ impl Parser<u8, Message, Error> for MessageDecoder {
                 ParseStatus::NeedsMore
             }
             Some(0) => match item {
-                0 => ParseStatus::Output(Message::Noop),
+                0 => {
+                    self.context.drain(..);
+                    ParseStatus::Output(vec![Message::Noop])
+                }
                 _ => {
                     self.context.push(item);
                     ParseStatus::NeedsMore
                 }
             },
             Some(_) => match item {
-                0 => match String::from_utf8(self.context.clone()) {
-                    Ok(s) => ParseStatus::Output(Message::Echo(s)),
-                    Err(e) => ParseStatus::Error(Error(e.to_string())),
-                },
+                0 => {
+                    let s = self.context.drain(..).collect::<Vec<u8>>();
+                    match String::from_utf8(s[1..].to_vec()) {
+                        Ok(s) => ParseStatus::Output(vec![Message::Echo(s)]),
+                        Err(e) => ParseStatus::Error(Error(e.to_string())),
+                    }
+                }
                 _ => {
                     self.context.push(item);
                     ParseStatus::NeedsMore
                 }
             },
         }
-    }
-
-    fn get_more(&mut self) -> Option<Message> {
-        None
     }
 }
 
@@ -119,9 +96,6 @@ impl Parser<std::io::Result<u8>, Message, Error> for MessageDecoder {
             Ok(item) => Parser::<u8, Message, Error>::process_next_item(self, item),
             Err(e) => ParseStatus::Error(e.into()),
         }
-    }
-    fn get_more(&mut self) -> Option<Message> {
-        None
     }
 }
 
@@ -211,21 +185,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     })
                     .take_while(|byte| take_unless!(byte, 3))
                     .parse_with(MessageDecoder::new())
-                    .inspect(|req| {
-                        let req = ok_or_log_err!(req);
-                        log::debug!("service got req: {req:?}");
+                    .inspect(|msg| {
+                        let msg = ok_or_log_err!(msg);
+                        log::debug!("service got msg: {msg:?}");
                     })
-                    .for_each(|req| {
+                    .for_each(|msg| {
                         async_lock!(tx, {
-                            let req = ok_or_log_err!(req);
-                            ok_or_log_err!(tx.send(req).await);
+                            let msg = ok_or_log_err!(msg);
+                            ok_or_log_err!(tx.send(msg).await);
                         })
-                    });
+                    })
+                    .then(|_| async_lock!(tx, tx.close_channel()));
                 let writer_fut = async {
                     let mut chunk_stream = rx
-                        .inspect(|req| {
-                            log::debug!("service sending req: {req:?}");
-                        })
+                        .inspect(|msg| log::debug!("service sending msg: {msg:?}"))
                         .parse_with(MessageEncoder::new())
                         .take_while(|byte| future::ready(byte.is_ok()))
                         .map(|byte| byte.unwrap())
@@ -234,6 +207,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         log::debug!("service sending bytes: {bytes:?}");
                         ok_or_log_err!(writer.write_all(&bytes).await);
                     }
+                    log::debug!("service sending EOT");
+                    ok_or_log_err!(writer.write_all(&[3]).await);
                 };
                 futures::future::join(reader_fut, writer_fut).await;
                 log::debug!("done handling client");
@@ -247,6 +222,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .parse_with(MessageEncoder::new())
                 .take_while(|byte| future::ready(byte.is_ok()))
                 .map(|byte| byte.unwrap())
+                .chain(stream::iter([3])) // EOT
                 .ready_chunks(16)
                 .for_each(|bytes| async_lock!(tx, ok_or_log_err!(tx.send(bytes).await)))
                 .then(|_| async { log::debug!("done encoding messages") });
@@ -255,15 +231,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     log::debug!("sending bytes: {bytes:?}");
                     ok_or_log_err!(client.write_all(&bytes).await);
                 }
-                log::debug!("done sending bytes");
+                log::debug!("client sending EOT");
+                ok_or_log_err!(client.write_all(&[3]).await);
             };
             futures::future::join(encode_fut, send_fut).await;
             log::debug!("receiving bytes on client");
             client
                 .bytes()
-                .for_each(|byte| async move {
-                    let byte = ok_or_log_err!(byte);
-                    log::debug!("client got byte: {byte}");
+                .take_while(|byte| take_unless!(byte, 3))
+                .map(|byte| byte.unwrap())
+                .inspect(|byte| log::debug!("client got byte: {byte}"))
+                .parse_with(MessageDecoder::new())
+                .for_each(|msg| async move {
+                    let msg = ok_or_log_err!(msg);
+                    log::debug!("client got msg: {msg:?}");
                 })
                 .await;
         };

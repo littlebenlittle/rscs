@@ -1,11 +1,7 @@
-use std::{fmt::Debug, io, marker::PhantomData, pin::Pin, sync::Mutex};
+use std::{marker::PhantomData, pin::Pin, sync::Mutex};
 
-use async_std::{
-    io::Bytes,
-    stream::TakeWhile,
-    task::{Context, Poll},
-};
-use futures::{channel::mpsc, future::Ready, stream, AsyncRead, Future, Stream, StreamExt};
+use async_std::task::{Context, Poll};
+use futures::{Stream, StreamExt};
 
 pub trait Parser<I, O, E> {
     fn process_next_item(&mut self, item: I) -> ParseStatus<O, E>;
@@ -30,30 +26,6 @@ where
         }
     }
 }
-
-// impl<I, O, E, P> ParseWith<I, O, E, P> for mpsc::Receiver<I> where P: Parser<I, O, E> {}
-//
-// impl<I, O, E, P, It> ParseWith<I, O, E, P> for stream::Iter<It>
-// where
-//     P: Parser<I, O, E>,
-//     It: Iterator<Item = I>,
-// {
-// }
-//
-// impl<O, E, P, R> ParseWith<io::Result<u8>, O, E, P> for Bytes<R>
-// where
-//     P: Parser<io::Result<u8>, O, E>,
-//     R: AsyncRead + Unpin,
-// {
-// }
-//
-// impl<I, O, E, P, S, Pred> ParseWith<I, O, E, P> for TakeWhile<S, Pred>
-// where
-//     S: ParseWith<I, O, E, P>,
-//     P: Parser<I, O, E>,
-//     Pred: FnMut(&I) -> bool,
-// {
-// }
 
 impl<I, O, E, P, S> ParseWith<I, O, E, P> for S
 where
