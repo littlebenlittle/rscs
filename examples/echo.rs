@@ -28,9 +28,6 @@ enum Message {
     Echo(String),
 }
 
-#[derive(Debug, PartialEq)]
-struct Error(String);
-
 struct MessageEncoder {}
 
 impl MessageEncoder {
@@ -98,10 +95,7 @@ impl Parser<u8, Message, Error> for MessageDecoder {
 }
 
 impl Parser<std::io::Result<u8>, Message, Error> for MessageDecoder {
-    fn process_next_item(
-        &mut self,
-        item: std::io::Result<u8>,
-    ) -> ParseStatus<Message, Error> {
+    fn process_next_item(&mut self, item: std::io::Result<u8>) -> ParseStatus<Message, Error> {
         match item {
             Ok(item) => Parser::<u8, Message, Error>::process_next_item(self, item),
             Err(e) => ParseStatus::Error(e.into()),
@@ -109,6 +103,9 @@ impl Parser<std::io::Result<u8>, Message, Error> for MessageDecoder {
     }
 }
 
+#[derive(Debug, PartialEq)]
+struct Error(String);
+    
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
@@ -140,7 +137,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             return;
                         }
                     };
-                    let (reader, writer) = stream.split();
+                    let (reader, mut writer) = stream.split();
                     reader
                         .bytes()
                         .parse_with(MessageDecoder::new()) // magic ✨
