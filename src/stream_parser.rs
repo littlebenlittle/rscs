@@ -1,4 +1,4 @@
-use std::{io, marker::PhantomData, pin::Pin, sync::Mutex};
+use std::{fmt::Debug, io, marker::PhantomData, pin::Pin, sync::Mutex};
 
 use async_std::{
     io::Bytes,
@@ -9,11 +9,10 @@ use futures::{channel::mpsc, future::Ready, stream, AsyncRead, Future, Stream, S
 
 pub trait Parser<I, O, E> {
     fn process_next_item(&mut self, item: I) -> ParseStatus<O, E>;
-    fn get_more(&mut self) -> Option<O>;
 }
 
 pub enum ParseStatus<T, E> {
-    Output(T),
+    Output(Vec<T>),
     NeedsMore,
     Error(E),
 }
@@ -26,6 +25,7 @@ where
         ParseWithStream {
             inner: Mutex::new(self),
             parser: Mutex::new(parser),
+            items: Mutex::new(Vec::new()),
             _phantom_data: PhantomData,
         }
     }
@@ -69,6 +69,7 @@ where
 {
     inner: Mutex<Si>,
     parser: Mutex<P>,
+    items: Mutex<Vec<O>>,
     _phantom_data: PhantomData<(O, E)>,
 }
 
@@ -79,10 +80,10 @@ where
 {
     type Item = Result<O, E>;
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if let Some(o) = self.parser.lock().unwrap().get_more() {
-            return Poll::Ready(Some(Ok(o)));
-        }
         loop {
+            if let Some(o) = self.items.lock().unwrap().pop() {
+                return Poll::Ready(Some(Ok(o)));
+            }
             let next_item: I = match self.inner.lock().unwrap().poll_next_unpin(cx) {
                 Poll::Ready(Some(t)) => t,
                 Poll::Ready(None) => break Poll::Ready(None),
@@ -90,7 +91,7 @@ where
             };
             use ParseStatus::*;
             match self.parser.lock().unwrap().process_next_item(next_item) {
-                Output(o) => break Poll::Ready(Some(Ok(o))),
+                Output(mut o) => self.items.lock().unwrap().append(&mut o),
                 NeedsMore => {}
                 Error(e) => break Poll::Ready(Some(Err(e))),
             }
