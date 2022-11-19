@@ -2,17 +2,19 @@ use std::{io, marker::PhantomData, pin::Pin, sync::Mutex};
 
 use async_std::{
     io::Bytes,
+    stream::TakeWhile,
     task::{Context, Poll},
 };
-use futures::{channel::mpsc, stream, AsyncRead, Stream, StreamExt};
+use futures::{channel::mpsc, future::Ready, stream, AsyncRead, Future, Stream, StreamExt};
 
 pub trait Parser<I, O, E> {
     fn process_next_item(&mut self, item: I) -> ParseStatus<O, E>;
+    fn get_more(&mut self) -> Option<O>;
 }
 
 pub enum ParseStatus<T, E> {
-    Finished(T),
-    Incomplete,
+    Output(T),
+    NeedsMore,
     Error(E),
 }
 
@@ -29,19 +31,34 @@ where
     }
 }
 
-impl<I, O, E, P> ParseWith<I, O, E, P> for mpsc::Receiver<I> where P: Parser<I, O, E> {}
+// impl<I, O, E, P> ParseWith<I, O, E, P> for mpsc::Receiver<I> where P: Parser<I, O, E> {}
+//
+// impl<I, O, E, P, It> ParseWith<I, O, E, P> for stream::Iter<It>
+// where
+//     P: Parser<I, O, E>,
+//     It: Iterator<Item = I>,
+// {
+// }
+//
+// impl<O, E, P, R> ParseWith<io::Result<u8>, O, E, P> for Bytes<R>
+// where
+//     P: Parser<io::Result<u8>, O, E>,
+//     R: AsyncRead + Unpin,
+// {
+// }
+//
+// impl<I, O, E, P, S, Pred> ParseWith<I, O, E, P> for TakeWhile<S, Pred>
+// where
+//     S: ParseWith<I, O, E, P>,
+//     P: Parser<I, O, E>,
+//     Pred: FnMut(&I) -> bool,
+// {
+// }
 
-impl<I, O, E, P, It> ParseWith<I, O, E, P> for stream::Iter<It>
+impl<I, O, E, P, S> ParseWith<I, O, E, P> for S
 where
+    S: Stream<Item = I>,
     P: Parser<I, O, E>,
-    It: Iterator<Item = I>,
-{
-}
-
-impl<O, E, P, S> ParseWith<io::Result<u8>, O, E, P> for Bytes<S>
-where
-    P: Parser<io::Result<u8>, O, E>,
-    S: AsyncRead + Unpin,
 {
 }
 
@@ -62,18 +79,20 @@ where
 {
     type Item = Result<O, E>;
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if let Some(o) = self.parser.lock().unwrap().get_more() {
+            return Poll::Ready(Some(Ok(o)));
+        }
         loop {
             let next_item: I = match self.inner.lock().unwrap().poll_next_unpin(cx) {
                 Poll::Ready(Some(t)) => t,
                 Poll::Ready(None) => break Poll::Ready(None),
                 Poll::Pending => break Poll::Pending,
             };
+            use ParseStatus::*;
             match self.parser.lock().unwrap().process_next_item(next_item) {
-                ParseStatus::Finished(o) => {
-                    break Poll::Ready(Some(Ok(o)));
-                }
-                ParseStatus::Incomplete => {}
-                ParseStatus::Error(e) => break Poll::Ready(Some(Err(e))),
+                Output(o) => break Poll::Ready(Some(Ok(o))),
+                NeedsMore => {}
+                Error(e) => break Poll::Ready(Some(Err(e))),
             }
         }
     }
