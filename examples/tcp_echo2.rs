@@ -184,7 +184,7 @@ impl Client {
         })
     }
 
-    async fn handle(self, mut tx: Sender<Result<Message>>, rx: Receiver<Message>) -> Result<()> {
+    async fn run(self, mut tx: Sender<Result<Message>>, rx: Receiver<Message>) -> Result<()> {
         let (reader, mut writer) = self.tcp_stream.split();
         let read_fut = async {
             let mut res_stream = reader
@@ -217,7 +217,7 @@ impl Client {
         Ok(())
     }
 
-    async fn run<F, O, Fut>(self, cls: F) -> Result<O>
+    async fn run_while<F, O, Fut>(self, cls: F) -> Result<O>
     where
         F: Fn(Sender<Message>, Receiver<Result<Message>>) -> Fut,
         Fut: Future<Output = O>,
@@ -225,7 +225,7 @@ impl Client {
         let (res_tx, res_rx) = mpsc::channel(0);
         let (req_tx, req_rx) = mpsc::channel(0);
         let (r1, r2) =
-            future::join(self.handle(res_tx, req_rx), cls(req_tx, res_rx)).await;
+            future::join(self.run(res_tx, req_rx), cls(req_tx, res_rx)).await;
         r1?;
         Ok(r2)
     }
@@ -328,7 +328,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         service
             .serve_while(async move {
                 client
-                    .run(|mut tx, mut rx| async move {
+                    .run_while(|mut tx, mut rx| async move {
                         for msg in [
                             Message::Noop,
                             Message::Echo("test".into()),
@@ -341,7 +341,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                             assert_eq!(rx.next().await, Some(Ok(msg)));
                         }
                         log::debug!("closing req channel");
-                        tx.close_channel(); // TODO figure out how close in Client::run
+                        tx.close_channel(); // TODO figure out how close in Client::run_while
                         Result::<()>::Ok(())
                     })
                     .await
