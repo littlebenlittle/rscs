@@ -4,10 +4,8 @@ use async_std::{
     task,
 };
 use futures::{
-    channel::mpsc,
-    future,
-    io::{ReadHalf, WriteHalf},
-    AsyncReadExt, Future, FutureExt, SinkExt, StreamExt,
+    channel::mpsc::{self, Receiver, Sender},
+    future, AsyncReadExt, Future, FutureExt, SinkExt, StreamExt,
 };
 use std::{
     fmt::Debug,
@@ -176,57 +174,41 @@ macro_rules! take_unless {
 
 type Result<T> = std::result::Result<T, Error>;
 struct Client {
-    reader: ReadHalf<TcpStream>,
-    writer: WriteHalf<TcpStream>,
-    req_tx: Arc<Mutex<mpsc::Sender<Message>>>,
-    req_rx: mpsc::Receiver<Message>,
-    res_tx: Arc<Mutex<mpsc::Sender<Result<Message>>>>,
-    res_rx: Option<mpsc::Receiver<Result<Message>>>,
+    tcp_stream: TcpStream,
 }
 
 impl Client {
     async fn new(listen: SocketAddr) -> Result<Self> {
-        let (res_tx, res_rx) = mpsc::channel(0);
-        let (req_tx, req_rx) = mpsc::channel(0);
-        let (reader, writer) = TcpStream::connect(listen).await?.split();
         Ok(Self {
-            reader,
-            writer,
-            req_tx: Arc::new(Mutex::new(req_tx)),
-            req_rx,
-            res_tx: Arc::new(Mutex::new(res_tx)),
-            res_rx: Some(res_rx),
+            tcp_stream: TcpStream::connect(listen).await?,
         })
     }
 
-    fn sender(&mut self) -> ClientSender {
-        ClientSender {
-            tx: self.req_tx.clone(),
-        }
-    }
-
-    fn receiver(&mut self) -> ClientReceiver {
-        ClientReceiver {
-            rx: self.res_rx.take().expect("can only take receiver once"),
-        }
-    }
-
-    async fn process(mut self) -> Result<()> {
+    async fn handle(self, mut tx: Sender<Result<Message>>, rx: Receiver<Message>) -> Result<()> {
+        let (reader, mut writer) = self.tcp_stream.split();
         let read_fut = async {
-            let mut res_stream = self
-                .reader
+            let mut res_stream = reader
                 .bytes()
                 .take_while(|byte| take_unless!(byte, 3))
-                .parse_with(MessageDecoder::new());
+                .parse_with(MessageDecoder::new())
+                .inspect(|msg| log::debug!("client received msg: {msg:?}"));
             while let Some(msg) = res_stream.next().await {
-                self.res_tx.lock().unwrap().send(msg).await?;
+                tx.send(msg).await?;
             }
+            log::debug!("done reading from client stream");
             Result::<()>::Ok(())
         };
         let write_fut = async {
-            while let Some(msg) = self.req_rx.next().await {
-                self.writer.write_all(&MessageEncoder::encode(&msg)).await?;
+            let mut byte_stream = rx
+                .inspect(|msg| log::debug!("client sending msg: {msg:?}"))
+                .parse_with(MessageEncoder::new())
+                .map(|byte| byte.unwrap())
+                .ready_chunks(16);
+            while let Some(bytes) = byte_stream.next().await {
+                writer.write_all(&bytes).await?;
             }
+            log::debug!("client sending EOT");
+            writer.write_all(&[3]).await?;
             Result::<()>::Ok(())
         };
         let (r1, r2) = future::join(read_fut, write_fut).await;
@@ -234,32 +216,25 @@ impl Client {
         r2?;
         Ok(())
     }
-}
 
-struct ClientSender {
-    tx: Arc<Mutex<mpsc::Sender<Message>>>,
-}
-
-impl ClientSender {
-    async fn send(&mut self, msg: Message) -> Result<()> {
-        Ok(self.tx.lock().unwrap().send(msg).await?)
-    }
-}
-
-struct ClientReceiver {
-    rx: mpsc::Receiver<Result<Message>>,
-}
-
-impl ClientReceiver {
-    async fn recv(&mut self) -> Option<Result<Message>> {
-        self.rx.next().await
+    async fn run<F, O, Fut>(self, cls: F) -> Result<O>
+    where
+        F: Fn(Sender<Message>, Receiver<Result<Message>>) -> Fut,
+        Fut: Future<Output = O>,
+    {
+        let (res_tx, res_rx) = mpsc::channel(0);
+        let (req_tx, req_rx) = mpsc::channel(0);
+        let (r1, r2) =
+            future::join(self.handle(res_tx, req_rx), cls(req_tx, res_rx)).await;
+        r1?;
+        Ok(r2)
     }
 }
 
 struct Service {
     listener: TcpListener,
-    shutdown_tx: Arc<Mutex<mpsc::Sender<()>>>,
-    shutdown_rx: mpsc::Receiver<()>,
+    shutdown_tx: Arc<Mutex<Sender<()>>>,
+    shutdown_rx: Receiver<()>,
 }
 
 impl Service {
@@ -326,6 +301,22 @@ impl Service {
             })
             .await
     }
+
+    async fn serve_while<F, O>(mut self, fut: F) -> O
+    where
+        F: Future<Output = O>,
+    {
+        let shutdown = self.shutdown();
+        let ((), result) = future::join(
+            self.serve(),
+            fut.then(|result| async move {
+                shutdown.await.unwrap();
+                result
+            }),
+        )
+        .await;
+        result
+    }
 }
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -333,33 +324,29 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let listen = "127.0.0.1:0".parse::<SocketAddr>()?;
     task::block_on(async {
         let mut service = Service::new(listen).await?;
-        let mut client = service.client().await?;
-        let shutdown = service.shutdown();
-        let client_fut = async move {
-            let mut sender = client.sender();
-            let mut receiver = client.receiver();
-            let send_fut = async move {
-                let msgs = [
-                    Message::Noop,
-                    Message::Echo("test".into()),
-                    Message::Noop,
-                    Message::Echo("somthing".into()),
-                    Message::Echo("else".into()),
-                    Message::Noop,
-                ];
-                for msg in msgs {
-                    match sender.send(msg.clone()).await {
-                        Ok(()) => {}
-                        Err(e) => log::error!("{e:?}"),
-                    }
-                    assert_eq!(receiver.recv().await, Some(Ok(msg)));
-                }
-            };
-            let (r1, _r2) = futures::future::join(client.process(), send_fut).await;
-            r1.unwrap();
-            shutdown.await.unwrap();
-        };
-        futures::future::join(client_fut, service.serve()).await;
+        let client = service.client().await?;
+        service
+            .serve_while(async move {
+                client
+                    .run(|mut tx, mut rx| async move {
+                        for msg in [
+                            Message::Noop,
+                            Message::Echo("test".into()),
+                            Message::Noop,
+                            Message::Echo("somthing".into()),
+                            Message::Echo("else".into()),
+                            Message::Noop,
+                        ] {
+                            tx.send(msg.clone()).await?;
+                            assert_eq!(rx.next().await, Some(Ok(msg)));
+                        }
+                        log::debug!("closing req channel");
+                        tx.close_channel(); // TODO figure out how close in Client::run
+                        Result::<()>::Ok(())
+                    })
+                    .await
+            })
+            .await??;
         Result::<()>::Ok(())
     })?;
     Ok(())
